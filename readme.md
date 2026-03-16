@@ -3,7 +3,7 @@
 Ce projet implémente une architecture de détection d'objets ultra-légère combinant le **Backbone MobileNetV3-Small** et le **Neck/Head de YOLOv11n (Nano)**. Le modèle est optimisé pour une inférence rapide sur les processeurs de smartphones (Android/iOS).
 
 ## 📊 Dataset
-Vous pouvez télécharger le dataset nécessaire à l'entraînement ici : [Télécharger le Dataset (Kaggle/Google Storage)](https://storage.googleapis.com/kaggle-data-sets/6709331/10808746/bundle/archive.zip?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=gcp-kaggle-com%40kaggle-161607.iam.gserviceaccount.com%2F20260316%2Fauto%2Fstorage%2Fgoog4_request&X-Goog-Date=20260316T115829Z&X-Goog-Expires=259200&X-Goog-SignedHeaders=host&X-Goog-Signature=9228ca4bcae9a9487c3b1bb3e9d6f457498c386a58e934ef29efb4b2efcc814f6eee93aaff4cd31636ad28a07479a3eadcfea9470b8b75df8ef5fbec08304aa9d209dedaaad38823624569354b22a539f0d14557a1993fdf169bfadbf71d4f6b7a9aae65759a045d46db8a3a558ee1a6390e60f2e4a8f6a4373c4c027a3ed34458fdb376c645d4029912f5485c184d10ef405d9f1c5d8b588c45485fa55e749010108110b103ee879d4ba3efdc5f998d511ba2f67a4bb6ab47aaa3c34aa73f1dea93be17cd37a048be4d12da8e00bd8f58ae6e7f552f1b856a378a056a9bfd7f4132d1c96267633eac98b17345422c9e4ac96ced6e95c7f50d035d8b7588915e)
+Vous pouvez accéder au dataset nécessaire à l'entraînement ici : [PlantDec Dataset (Kaggle)](https://www.kaggle.com/datasets/andresmgs/plantdec)
 
 ## 🚀 Guide d'installation et d'utilisation (De A à Z)
 
