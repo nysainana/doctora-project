@@ -1,4 +1,4 @@
 data/
-source/venv/
-source/yolov11n_mobilenet_v3.onnx
-source/yolov11n_mobilenet_v3.onnx.data
+venv/
+yolov11n_mobilenet_v3.onnx
+yolov11n_mobilenet_v3.onnx.data

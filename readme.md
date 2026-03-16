@@ -12,19 +12,16 @@ Ce projet implémente une architecture de détection d'objets ultra-légère com
 Ouvrez votre terminal dans le dossier racine du projet et suivez ces étapes :
 
 ```bash
-# 1. Se déplacer dans le dossier source
-cd source
-
-# 2. Créer l'environnement virtuel (venv)
+# 1. Créer l'environnement virtuel (venv)
 python -m venv venv
 
-# 3. Activer l'environnement virtuel
+# 2. Activer l'environnement virtuel
 # Sur Windows :
 .\venv\Scripts\activate
 # Sur Linux/macOS :
 source venv/bin/activate
 
-# 4. Installer les dépendances
+# 3. Installer les dépendances
 pip install torch torchvision onnx onnxscript pillow
 ```
 
@@ -44,7 +41,6 @@ data/
 
 **Lancer l'entraînement :**
 ```bash
-# Depuis le dossier source avec venv activé
 python train.py
 ```
 *Le script sauvegardera un fichier `.pth` à chaque époque (ex: `yolov11n_mobile_epoch_1.pth`).*

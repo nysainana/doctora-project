@@ -93,13 +93,13 @@ def train_model():
     img_size = 320
     batch_size = 8
     epochs = 10
-    num_classes = 80 # À ajuster selon votre dataset
+    num_classes = 30 # À ajuster selon votre dataset
     
     # Chemins des données
-    train_img = "../data/train/images"
-    train_lbl = "../data/train/labels"
-    valid_img = "../data/valid/images"
-    valid_lbl = "../data/valid/labels"
+    train_img = "./data/train/images"
+    train_lbl = "./data/train/labels"
+    valid_img = "./data/valid/images"
+    valid_lbl = "./data/valid/labels"
 
     # Datasets & Dataloaders
     train_dataset = YOLODataset(train_img, train_lbl, img_size=img_size)
@@ -149,7 +149,7 @@ def train_model():
 
 if __name__ == "__main__":
     # Vérifier que les dossiers existent avant de lancer
-    if os.path.exists("../data/train/images"):
+    if os.path.exists("./data/train/images"):
         train_model()
     else:
         print("Erreur : Dossier 'data/train/images' introuvable. Vérifiez votre structure de fichiers.")
