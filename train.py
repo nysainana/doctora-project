@@ -10,55 +10,21 @@ from tqdm import tqdm
 import numpy as np
 from model import YOLOv11nMobileNet, DFL
 
-# --- Helper: IoU & mAP ---
-def box_iou(box1, box2):
-    # box1, box2: [N, 4] (x1, y1, x2, y2)
-    lt = torch.max(box1[:, None, :2], box2[:, :2])
-    rb = torch.min(box1[:, None, 2:], box2[:, 2:])
-    wh = (rb - lt).clamp(min=0)
-    inter = wh[:, :, 0] * wh[:, :, 1]
-    area1 = (box1[:, 2] - box1[:, 0]) * (box1[:, 3] - box1[:, 1])
-    area2 = (box2[:, 2] - box2[:, 0]) * (box2[:, 3] - box2[:, 1])
-    return inter / (area1[:, None] + area2 - inter + 1e-7)
+# --- Helpers ---
+def dist2bbox(distance, anchor_points, stride_tensor):
+    lt, rb = distance.chunk(2, 1)
+    x1y1 = anchor_points - lt * stride_tensor
+    x2y2 = anchor_points + rb * stride_tensor
+    return torch.cat((x1y1, x2y2), 1)
 
-def calculate_batch_metrics(outputs, targets, iou_threshold=0.45):
-    """
-    Calcule la précision moyenne (mAP) simplifiée pour un batch.
-    outputs: [B, 64 + num_classes, 2100]
-    """
-    device = outputs.device
-    num_classes = outputs.shape[1] - 64
-    batch_size = outputs.shape[0]
-    
-    # Décodage rapide pour la métrique
-    pred_scores, pred_indices = torch.max(torch.softmax(outputs[:, 64:, :], dim=1), dim=1)
-    
-    total_tp = 0
-    total_gt = 0
-    
-    for i in range(batch_size):
-        gt = targets[i]
-        if len(gt) == 0: continue
-        
-        total_gt += len(gt)
-        # On ne garde que les prédictions avec un score > 0.25
-        mask = pred_scores[i] > 0.25
-        if not mask.any(): continue
-        
-        # Pour une métrique réelle, il faudrait NMS (Non-Maximum Suppression)
-        # Ici on simplifie pour la rapidité d'affichage
-        p_cls = pred_indices[i][mask]
-        
-        for g in gt:
-            g_cls = int(g[0])
-            if g_cls in p_cls:
-                total_tp += 1
-                break # On compte un TP par classe présente
-                
-    recall = (total_tp / total_gt) if total_gt > 0 else 0
-    return recall * 100
+def bbox_iou(box1, box2):
+    b1_x1, b1_y1, b1_x2, b1_y2 = box1.chunk(4, -1)
+    b2_x1, b2_y1, b2_x2, b2_y2 = box2.chunk(4, -1)
+    inter = (torch.min(b1_x2, b2_x2) - torch.max(b1_x1, b2_x1)).clamp(0) * \
+            (torch.min(b1_y2, b2_y2) - torch.max(b1_y1, b2_y1)).clamp(0)
+    union = (b1_x2 - b1_x1) * (b1_y2 - b1_y1) + (b2_x2 - b2_x1) * (b2_y2 - b2_y1) - inter + 1e-7
+    return inter / union
 
-# --- Helper: Grille ---
 def make_anchors(strides=[8, 16, 32], feats_shapes=[(40,40), (20,20), (10,10)]):
     anchor_points, stride_tensor = [], []
     for i, stride in enumerate(strides):
@@ -66,127 +32,141 @@ def make_anchors(strides=[8, 16, 32], feats_shapes=[(40,40), (20,20), (10,10)]):
         sx = torch.arange(w) + 0.5
         sy = torch.arange(h) + 0.5
         grid_y, grid_x = torch.meshgrid(sy, sx, indexing='ij')
-        anchor_points.append(torch.stack((grid_x, grid_y), -1).view(-1, 2) * stride)
+        anchor_points.append(torch.stack((grid_x, grid_y), -1).view(-1, 2))
         stride_tensor.append(torch.full((h * w, 1), stride))
     return torch.cat(anchor_points), torch.cat(stride_tensor)
 
-# --- Dataset YOLO ---
+# --- Métriques ---
+@torch.no_grad()
+def calculate_batch_metrics(outputs, targets):
+    device = outputs.device
+    pred_scores = torch.sigmoid(outputs[:, 64:, :])
+    max_scores, pred_cls = torch.max(pred_scores, dim=1)
+    tp, total_gt = 0, 0
+    for i in range(len(targets)):
+        gt = targets[i]
+        if len(gt) == 0: continue
+        total_gt += len(gt)
+        mask = max_scores[i] > 0.1 # Seuil bas pour le monitoring
+        if not mask.any(): continue
+        p_cls = pred_cls[i][mask]
+        for g in gt:
+            if int(g[0]) in p_cls:
+                tp += 1
+                break
+    return (tp / (total_gt + 1e-7)) * 100
+
+# --- Dataset ---
 class YOLODataset(Dataset):
-    def __init__(self, img_dir, label_dir, img_size=320, transform=None):
-        search_path_jpg = os.path.abspath(os.path.join(img_dir, "*.jpg"))
-        search_path_png = os.path.abspath(os.path.join(img_dir, "*.png"))
-        self.img_paths = sorted(glob.glob(search_path_jpg) + glob.glob(search_path_png))
-        self.label_dir = os.path.abspath(label_dir)
-        self.img_size = img_size
-        self.transform = transform or transforms.Compose([
+    def __init__(self, img_dir, label_dir, img_size=320):
+        self.img_paths = sorted(glob.glob(os.path.join(img_dir, "*.jpg")) + glob.glob(os.path.join(img_dir, "*.png")))
+        self.label_dir = label_dir
+        self.transform = transforms.Compose([
             transforms.Resize((img_size, img_size)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
+        print(f"Dataset : {len(self.img_paths)} images.")
 
     def __len__(self): return len(self.img_paths)
     def __getitem__(self, idx):
         img_path = self.img_paths[idx]
-        if os.name == 'nt' and not img_path.startswith("\\\\?\\"): img_path = "\\\\?\\" + img_path
-        try:
-            image = Image.open(img_path).convert("RGB")
-        except: return self.__getitem__((idx + 1) % len(self.img_paths))
-        clean_path = img_path.replace("\\\\?\\", "")
-        label_filename = os.path.splitext(os.path.basename(clean_path))[0] + ".txt"
-        label_path = os.path.join(self.label_dir, label_filename)
-        if os.name == 'nt' and not label_path.startswith("\\\\?\\"): label_path = "\\\\?\\" + label_path
+        image = Image.open(img_path).convert("RGB")
+        label_path = os.path.join(self.label_dir, os.path.splitext(os.path.basename(img_path))[0] + ".txt")
         labels = []
         if os.path.exists(label_path):
             with open(label_path, "r") as f:
-                for line in f.readlines(): labels.append([float(x) for x in line.split()])
-        if self.transform: image = self.transform(image)
-        return image, torch.tensor(labels)
+                for line in f.readlines():
+                    v = [float(x) for x in line.split()]
+                    if len(v) == 5: labels.append(v)
+        return self.transform(image), torch.tensor(labels) if labels else torch.zeros((0, 5))
 
 def collate_fn(batch):
     images, targets = zip(*batch)
     return torch.stack(images, 0), targets
 
-# --- Loss Améliorée ---
-class ImprovedYOLOLoss(nn.Module):
+# --- Loss ---
+class RobustYOLOLoss(nn.Module):
     def __init__(self, num_classes=30, reg_max=16):
         super().__init__()
         self.num_classes = num_classes
         self.reg_max = reg_max
-        self.bce_cls = nn.BCEWithLogitsLoss(reduction='mean')
-        self.mse_box = nn.HuberLoss(reduction='mean')
-        self.anchors, _ = make_anchors()
+        self.bce = nn.BCEWithLogitsLoss(reduction='sum')
+        self.anchors, self.strides = make_anchors()
+        self.dfl_conv = DFL(reg_max)
 
     def forward(self, pred, targets):
         device = pred.device
         batch_size = pred.shape[0]
-        anchors = self.anchors.to(device)
-        pred_dist = pred[:, :4*self.reg_max, :]
-        pred_cls = pred[:, 4*self.reg_max:, :]
-        
-        target_cls = torch.zeros_like(pred_cls)
-        fg_mask = torch.zeros((batch_size, 2100), dtype=torch.bool, device=device)
+        anchors, strides = self.anchors.to(device), self.strides.to(device)
+        pred_dist, pred_cls = pred[:, :64, :], pred[:, 64:, :]
+        loss_cls, loss_box = torch.zeros(1, device=device), torch.zeros(1, device=device)
+        n_targets = 0
+        for i in range(batch_size):
+            target = targets[i]
+            if len(target) == 0:
+                loss_cls += self.bce(pred_cls[i], torch.zeros_like(pred_cls[i])) * 0.05
+                continue
+            n_targets += len(target)
+            gt_pixels = target[:, 1:].clone()
+            gt_pixels[:, [0, 2]] *= 320
+            gt_pixels[:, [1, 3]] *= 320
+            gt_box = torch.cat([gt_pixels[:, :2] - gt_pixels[:, 2:]/2, gt_pixels[:, :2] + gt_pixels[:, 2:]/2], 1)
+            target_cls = torch.zeros_like(pred_cls[i])
+            fg_mask = torch.zeros(2100, dtype=torch.bool, device=device)
+            matched_gt = torch.zeros((2100, 4), device=device)
+            anchor_centers = anchors * strides
+            for gt_idx, gt_center in enumerate(gt_pixels[:, :2]):
+                dist = torch.norm(anchor_centers - gt_center, dim=1)
+                _, topk = torch.topk(dist, k=10, largest=False)
+                fg_mask[topk] = True
+                target_cls[target[gt_idx, 0].long(), topk] = 1.0
+                matched_gt[topk] = gt_box[gt_idx]
+            loss_cls += self.bce(pred_cls[i], target_cls)
+            if fg_mask.any():
+                p_dist = self.dfl_conv(pred_dist[i:i+1, :, fg_mask]).squeeze(0)
+                p_box = dist2bbox(p_dist.T, anchors[fg_mask], strides[fg_mask])
+                iou = bbox_iou(p_box, matched_gt[fg_mask])
+                loss_box += (1.0 - iou).sum()
+        divisor = max(n_targets, 1)
+        return (loss_box / divisor), (loss_cls / divisor / 10.0), n_targets
 
-        for i, t in enumerate(targets):
-            if len(t) == 0: continue
-            gt_classes = t[:, 0].long()
-            gt_centers = t[:, 1:3] * 320
-            for gt_idx, gt_center in enumerate(gt_centers):
-                dist = torch.norm(anchors - gt_center, dim=1)
-                best_idx = torch.argmin(dist)
-                fg_mask[i, best_idx] = True
-                target_cls[i, gt_classes[gt_idx], best_idx] = 1.0
-
-        loss_cls = self.bce_cls(pred_cls, target_cls)
-        if fg_mask.any():
-            loss_box = self.mse_box(pred_dist.mean(dim=1)[fg_mask], torch.ones(fg_mask.sum(), device=device))
-        else:
-            loss_box = pred_dist.sum() * 0
-        return loss_box, loss_cls
-
-# --- Boucle d'Entraînement ---
+# --- Train ---
 def train_model():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    num_classes = 30
-    model = YOLOv11nMobileNet(num_classes=num_classes).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
-    criterion = ImprovedYOLOLoss(num_classes=num_classes)
+    model = YOLOv11nMobileNet(num_classes=30).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
     
+    # Scheduler: Réduit le LR par 10 si la perte ne descend plus pendant 3 époques
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=3)
+    
+    criterion = RobustYOLOLoss(num_classes=30)
     train_loader = DataLoader(YOLODataset("./data/train/images", "./data/train/labels"), batch_size=16, shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(YOLODataset("./data/valid/images", "./data/valid/labels"), batch_size=16, shuffle=False, collate_fn=collate_fn)
-
-    print(f"Entraînement sur {device} | mAP@0.5 activé")
     
-    for epoch in range(10):
+    for epoch in range(100): # Augmenté pour laisser le temps au nouveau modèle
         model.train()
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/10 [Train]")
-        t_loss, t_map = 0, 0
-        for images, targets in pbar:
-            images = images.to(device)
+        sum_loss, sum_acc = 0, 0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
+        for imgs, targets in pbar:
+            imgs = imgs.to(device)
             optimizer.zero_grad()
-            outputs = model(images)
-            l_box, l_cls = criterion(outputs, targets)
-            (l_box + l_cls).backward()
+            out = model(imgs)
+            l_box, l_cls, n_obj = criterion(out, targets)
+            total_loss = l_box * 5.0 + l_cls
+            total_loss.backward()
             optimizer.step()
-            
-            m_ap = calculate_batch_metrics(outputs, targets)
-            t_loss += (l_box + l_cls).item()
-            t_map += m_ap
-            pbar.set_postfix({"Loss": f"{(l_box+l_cls).item():.4f}", "mAP": f"{m_ap:.1f}%"})
+            acc = calculate_batch_metrics(out, targets)
+            sum_loss += total_loss.item()
+            sum_acc += acc
+            pbar.set_postfix({"Loss": f"{total_loss.item():.2f}", "Acc": f"{acc:.1f}%", "Obj": n_obj})
 
-        model.eval()
-        v_loss, v_map = 0, 0
-        with torch.no_grad():
-            for images, targets in tqdm(val_loader, desc="Valid"):
-                images = images.to(device)
-                outputs = model(images)
-                l_box, l_cls = criterion(outputs, targets)
-                m_ap = calculate_batch_metrics(outputs, targets)
-                v_loss += (l_box + l_cls).item()
-                v_map += m_ap
-
-        print(f"\n>> Epoch {epoch+1} Results:")
-        print(f"   TRAIN -> Loss: {t_loss/len(train_loader):.4f} | mAP: {t_map/len(train_loader):.1f}%")
-        print(f"   VALID -> Loss: {v_loss/len(val_loader):.4f} | mAP: {v_map/len(val_loader):.1f}%")
+        avg_loss = sum_loss / len(train_loader)
+        avg_acc = sum_acc / len(train_loader)
+        print(f"\n--- RÉSUMÉ ÉPOQUE {epoch+1} ---")
+        print(f"Loss: {avg_loss:.4f} | Accuracy: {avg_acc:.1f}%")
+        
+        # Mise à jour du scheduler
+        scheduler.step(avg_loss)
         torch.save(model.state_dict(), f"yolov11n_mobile_epoch_{epoch+1}.pth")
 
 if __name__ == "__main__":
