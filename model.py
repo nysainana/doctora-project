@@ -116,12 +116,22 @@ class YOLOv11nMobileNet(nn.Module):
         })
 
     def _init_weights(self):
+        import math
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                # Ne pas réinitialiser les couches qui ne s'entraînent pas (comme DFL)
+                if m.weight.requires_grad:
+                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
             elif isinstance(m, nn.BatchNorm2d):
                 m.eps = 1e-3
                 m.momentum = 0.03
+        
+        # Initialisation du biais pour la classification (prior_prob=0.01)
+        # Aide à éviter que le modèle ne prédise n'importe quoi au début à cause du déséquilibre de classes
+        prior_prob = 0.01
+        bias_init = -math.log((1 - prior_prob) / prior_prob)
+        for head in [self.head_p3, self.head_p4, self.head_p5]:
+            nn.init.constant_(head['cls'][-1].bias, bias_init)
 
     def forward(self, x):
         feats = self.backbone(x)
