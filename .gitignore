@@ -1,4 +1,13 @@
 data/
+yolov11n_mobile*
 venv/
-yolov11n_mobilenet_v3.onnx
-yolov11n_mobilenet_v3.onnx.data
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.vscode/
+.idea/
+*.onnx
+*.pth
+*.pth.*
+*.onnx.*

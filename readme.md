@@ -25,7 +25,7 @@ python -m venv venv
 source venv/bin/activate
 
 # 3. Installer les dépendances
-pip install torch torchvision onnx onnxscript pillow
+pip install torch torchvision onnx onnxscript pillow tqdm
 ```
 
 ### 3. Entraînement du modèle
