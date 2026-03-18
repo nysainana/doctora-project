@@ -12,9 +12,11 @@ from model import YOLOv11nMobileNet, DFL
 
 # --- Helpers ---
 def dist2bbox(distance, anchor_points, stride_tensor):
+    # Les sorties 'distance' (lt, rb) sont en unités de grille.
+    # On doit les soustraire/ajouter aux anchor_points (grille) puis multiplier par le stride pour avoir les pixels.
     lt, rb = distance.chunk(2, 1)
-    x1y1 = anchor_points - lt * stride_tensor
-    x2y2 = anchor_points + rb * stride_tensor
+    x1y1 = (anchor_points - lt) * stride_tensor
+    x2y2 = (anchor_points + rb) * stride_tensor
     return torch.cat((x1y1, x2y2), 1)
 
 def bbox_iou(box1, box2):
@@ -47,13 +49,13 @@ def calculate_batch_metrics(outputs, targets):
         gt = targets[i]
         if len(gt) == 0: continue
         total_gt += len(gt)
-        mask = max_scores[i] > 0.1 # Seuil bas pour le monitoring
+        mask = max_scores[i] > 0.3 # Seuil plus strict pour l'exactitude
         if not mask.any(): continue
-        p_cls = pred_cls[i][mask]
+        p_cls = pred_cls[i][mask].tolist()
         for g in gt:
             if int(g[0]) in p_cls:
                 tp += 1
-                break
+                # On ne retire pas de p_cls pour rester simple, mais on compte chaque GT trouvé
     return (tp / (total_gt + 1e-7)) * 100
 
 # --- Dataset ---
@@ -141,33 +143,45 @@ def train_model():
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=3)
     
     criterion = RobustYOLOLoss(num_classes=30)
-    train_loader = DataLoader(YOLODataset("./data/train/images", "./data/train/labels"), batch_size=16, shuffle=True, collate_fn=collate_fn)
+    train_loader = DataLoader(YOLODataset("./data/train/images", "./data/train/labels"), batch_size=8, shuffle=True, collate_fn=collate_fn)
     
-    for epoch in range(100): # Augmenté pour laisser le temps au nouveau modèle
-        model.train()
-        sum_loss, sum_acc = 0, 0
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
-        for imgs, targets in pbar:
-            imgs = imgs.to(device)
-            optimizer.zero_grad()
-            out = model(imgs)
-            l_box, l_cls, n_obj = criterion(out, targets)
-            total_loss = l_box * 5.0 + l_cls
-            total_loss.backward()
-            optimizer.step()
-            acc = calculate_batch_metrics(out, targets)
-            sum_loss += total_loss.item()
-            sum_acc += acc
-            pbar.set_postfix({"Loss": f"{total_loss.item():.2f}", "Acc": f"{acc:.1f}%", "Obj": n_obj})
+    try:
+        for epoch in range(100): # Augmenté pour laisser le temps au nouveau modèle
+            model.train()
+            sum_loss, sum_acc = 0, 0
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
+            for imgs, targets in pbar:
+                imgs = imgs.to(device)
+                optimizer.zero_grad()
+                out = model(imgs)
+                l_box, l_cls, n_obj = criterion(out, targets)
+                total_loss = l_box * 5.0 + l_cls
+                
+                if torch.isnan(total_loss):
+                    print(f"NaN Loss detected at Epoch {epoch+1}")
+                    continue
 
-        avg_loss = sum_loss / len(train_loader)
-        avg_acc = sum_acc / len(train_loader)
-        print(f"\n--- RÉSUMÉ ÉPOQUE {epoch+1} ---")
-        print(f"Loss: {avg_loss:.4f} | Accuracy: {avg_acc:.1f}%")
-        
-        # Mise à jour du scheduler
-        scheduler.step(avg_loss)
-        torch.save(model.state_dict(), f"yolov11n_mobile_epoch_{epoch+1}.pth")
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+                optimizer.step()
+                
+                acc = calculate_batch_metrics(out, targets)
+                sum_loss += total_loss.item()
+                sum_acc += acc
+                pbar.set_postfix({"Loss": f"{total_loss.item():.2f}", "Acc": f"{acc:.1f}%", "Obj": n_obj})
+
+            avg_loss = sum_loss / len(train_loader)
+            avg_acc = sum_acc / len(train_loader)
+            print(f"\n--- RÉSUMÉ ÉPOQUE {epoch+1} ---")
+            print(f"Loss: {avg_loss:.4f} | Accuracy: {avg_acc:.1f}%")
+            
+            # Mise à jour du scheduler
+            scheduler.step(avg_loss)
+            torch.save(model.state_dict(), f"yolov11n_mobile_epoch_{epoch+1}.pth")
+    except Exception as e:
+        import traceback
+        print(f"CRASH détecté : {e}")
+        traceback.print_exc()
 
 if __name__ == "__main__":
     train_model()
