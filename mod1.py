@@ -74,8 +74,9 @@ class Modele(nn.Module):
         for p,h in zip([p3,p4,p5],[self.h3,self.h4,self.h5]):
             box,obj,cls = h(p)
             b,_,hgt,wgt = box.shape
-            box = torch.sigmoid(box).view(b,4,-1)
-            obj = obj.view(b,1,-1)   # BCEWithLogitsLoss → pas sigmoid
-            cls = cls.view(b,self.nc,-1)  # BCEWithLogitsLoss → pas sigmoid
+            # On ne fait plus de sigmoid global ici, on laisse la Loss gérer le décodage relatif
+            box = box.view(b,4,-1)
+            obj = obj.view(b,1,-1)
+            cls = cls.view(b,self.nc,-1)
             outputs.append(torch.cat([box,obj,cls],1))
         return torch.cat(outputs,2)

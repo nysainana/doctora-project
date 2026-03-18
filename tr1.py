@@ -16,10 +16,10 @@ CONFIG = {
     "batch_size": 8,
     "img_size": 320,
     "lr": 1e-3,
-    "train_img": Path("D:/elysa/doctora-project/data/train/images"),
-    "train_label": Path("D:/elysa/doctora-project/data/train/labels"),
-    "val_img": Path("D:/elysa/doctora-project/data/valid/images"),
-    "val_label": Path("D:/elysa/doctora-project/data/valid/labels"),
+    "train_img": Path("data/train/images"),
+    "train_label": Path("data/train/labels"),
+    "val_img": Path("data/valid/images"),
+    "val_label": Path("data/valid/labels"),
     "checkpoint_dir": Path("checkpoints")
 }
 os.makedirs(CONFIG["checkpoint_dir"], exist_ok=True)
@@ -31,6 +31,17 @@ def get_long_path(path):
     if sys.platform == "win32" and not abs_path.startswith("\\\\?\\"):
         return "\\\\?\\" + abs_path
     return abs_path
+
+def make_anchors(img_size=320, strides=[8, 16, 32]):
+    """Génère les coordonnées (x, y) pour chaque point de la grille."""
+    anchor_points = []
+    for s in strides:
+        h, w = img_size // s, img_size // s
+        sx = torch.arange(w) + 0.5
+        sy = torch.arange(h) + 0.5
+        grid_y, grid_x = torch.meshgrid(sy, sx, indexing='ij')
+        anchor_points.append(torch.stack((grid_x, grid_y), -1).view(-1, 2) * s)
+    return torch.cat(anchor_points)
 
 # ------------------------ Dataset ------------------------
 class Dataset(torch.utils.data.Dataset):
@@ -74,43 +85,72 @@ def collate_fn(batch):
 class Loss(nn.Module):
     def __init__(self, nc, device):
         super().__init__()
-        self.bce = nn.BCEWithLogitsLoss()
+        # On pondère énormément les exemples positifs pour compenser le déséquilibre (1 vs 2100)
+        self.bce_obj = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([20.0]).to(device))
+        self.bce_cls = nn.BCEWithLogitsLoss()
+        self.mse = nn.MSELoss()
         self.nc = nc
         self.device = device
+        self.anchors = make_anchors().to(device)
+
     def forward(self, pred, targets):
         B, C, N = pred.shape
-        pb = pred[:, :4, :]
-        pc = pred[:, 4:, :]
-        loss = 0
+        pb = pred[:, :4, :]  # box offsets
+        po = pred[:, 4, :]   # objectness logits
+        pc = pred[:, 5:, :]  # class logits
+        
+        loss_box = 0
+        loss_obj = 0
+        loss_cls = 0
+        
         for i in range(B):
-            if len(targets[i]) == 0:
-                continue
             t = targets[i].to(self.device)
-            boxes = t[:, 1:5] * CONFIG["img_size"]
-            cls = t[:, 0].long()
-            idx = torch.randint(0, N, (len(t),), device=pred.device)
-            loss += ((pb[i, :, idx].T - boxes) ** 2).mean()
-            tcls = torch.zeros_like(pc[i])
-            for j, c in enumerate(cls):
-                tcls[c, idx[j]] = 1
-            loss += self.bce(pc[i], tcls)
-        return loss
+            tobj = torch.zeros(N, device=self.device)
+            
+            if len(t) > 0:
+                t_centers = t[:, 1:3] * CONFIG["img_size"]
+                dists = torch.cdist(t_centers, self.anchors)
+                idx = dists.argmin(dim=1) # [num_t]
+                
+                # Cibles pour les boîtes : le modèle doit prédire la boîte normalisée
+                # On utilise sigmoid sur la prédiction pour rester entre 0 et 1
+                pred_boxes = torch.sigmoid(pb[i, :, idx].T)
+                loss_box += self.mse(pred_boxes, t[:, 1:5])
+                
+                # Cibles pour les classes
+                t_cls = torch.zeros((len(t), self.nc), device=self.device)
+                for j, c in enumerate(t[:, 0].long()):
+                    if c < self.nc: t_cls[j, c] = 1
+                loss_cls += self.bce_cls(pc[i, :, idx].T, t_cls)
+                
+                # Objectness : marquer les ancres matchées
+                tobj[idx] = 1.0
+            
+            loss_obj += self.bce_obj(po[i], tobj)
+            
+        return (loss_box * 5.0) + (loss_obj * 1.0) + (loss_cls * 1.0)
 
 # ------------------------ Metrics ------------------------
 def accuracy(pred, targets):
     total = 0
     correct = 0
     B, C, N = pred.shape
-    pb = torch.sigmoid(pred[:, 4:, :])
+    # Pour l'accuracy, on regarde les classes uniquement là où il devrait y avoir des objets
+    pc = torch.sigmoid(pred[:, 5:, :])
+    anchors = make_anchors().to(pred.device)
+    
     for i in range(B):
-        if len(targets[i]) == 0:
-            continue
         t = targets[i].to(pred.device)
-        cls = t[:, 0].long()
-        idx = torch.randint(0, N, (len(t),), device=pred.device)
-        for j, c in enumerate(cls):
-            p_class = torch.argmax(pb[i, :, idx[j]])
-            if p_class == c:
+        if len(t) == 0: continue
+        t_centers = t[:, 1:3] * CONFIG["img_size"]
+        dists = torch.cdist(t_centers, anchors)
+        idx = dists.argmin(dim=1)
+        
+        for j, target in enumerate(t):
+            c_target = int(target[0])
+            # On prend la classe la plus probable à l'endroit matché
+            p_cls = torch.argmax(pc[i, :, idx[j]])
+            if p_cls == c_target:
                 correct += 1
             total += 1
     return correct / total if total > 0 else 0
