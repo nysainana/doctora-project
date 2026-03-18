@@ -4,7 +4,8 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from PIL import Image
-import glob, os
+import os, sys
+from pathlib import Path
 from tqdm import tqdm
 from mod1 import Modele  # ton modèle MobileNetV3 + YOLOv8 style
 
@@ -15,19 +16,28 @@ CONFIG = {
     "batch_size": 8,
     "img_size": 320,
     "lr": 1e-3,
-    "train_img": "D:/elysa/doctora-project/data/train/images",
-    "train_label": "D:/elysa/doctora-project/data/train/labels",
-    "val_img": "D:/elysa/doctora-project/data/valid/images",
-    "val_label": "D:/elysa/doctora-project/data/valid/labels",
-    "checkpoint_dir": "checkpoints"
+    "train_img": Path("D:/elysa/doctora-project/data/train/images"),
+    "train_label": Path("D:/elysa/doctora-project/data/train/labels"),
+    "val_img": Path("D:/elysa/doctora-project/data/valid/images"),
+    "val_label": Path("D:/elysa/doctora-project/data/valid/labels"),
+    "checkpoint_dir": Path("checkpoints")
 }
 os.makedirs(CONFIG["checkpoint_dir"], exist_ok=True)
+
+# ------------------------ Helpers ------------------------
+def get_long_path(path):
+    """Prépare le chemin pour Windows pour supporter les noms longs (> 260 caractères)."""
+    abs_path = str(Path(path).absolute())
+    if sys.platform == "win32" and not abs_path.startswith("\\\\?\\"):
+        return "\\\\?\\" + abs_path
+    return abs_path
 
 # ------------------------ Dataset ------------------------
 class Dataset(torch.utils.data.Dataset):
     def __init__(self, img_dir, label_dir, size):
-        self.imgs = glob.glob(img_dir + "/*.jpg")
-        self.label_dir = label_dir
+        self.img_dir = Path(img_dir)
+        self.label_dir = Path(label_dir)
+        self.imgs = list(self.img_dir.glob("*.jpg")) + list(self.img_dir.glob("*.jpeg")) + list(self.img_dir.glob("*.png"))
         self.tf = transforms.Compose([
             transforms.Resize((size, size)),
             transforms.ToTensor()
@@ -35,16 +45,27 @@ class Dataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.imgs)
     def __getitem__(self, i):
-        img = Image.open(self.imgs[i]).convert("RGB")
+        img_path = self.imgs[i]
+        long_img_path = get_long_path(img_path)
+        img = Image.open(long_img_path).convert("RGB")
         img = self.tf(img)
-        label_path = os.path.join(self.label_dir, os.path.basename(self.imgs[i]).replace(".jpg", ".txt"))
+        
+        label_path = self.label_dir / (img_path.stem + ".txt")
+        long_label_path = get_long_path(label_path)
+        
         labels = []
-        if os.path.exists(label_path):
-            for l in open(label_path):
-                parts = [float(x) for x in l.split()]
-                if len(parts) == 5:
-                    labels.append(parts)
+        if os.path.exists(long_label_path):
+            try:
+                with open(long_label_path, "r") as f:
+                    for l in f:
+                        parts = [float(x) for x in l.split()]
+                        if len(parts) == 5:
+                            labels.append(parts)
+            except Exception as e:
+                print(f"Erreur lecture label {label_path}: {e}")
+                
         return img, torch.tensor(labels)
+
 def collate_fn(batch):
     imgs, targets = zip(*batch)
     return torch.stack(imgs), targets
