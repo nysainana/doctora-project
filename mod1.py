@@ -1,12 +1,8 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
 from torchvision.models._utils import IntermediateLayerGetter
 
-# ------------------------
-# Basic
-# ------------------------
 def autopad(k): return k // 2
 
 class Conv(nn.Module):
@@ -18,9 +14,6 @@ class Conv(nn.Module):
     def forward(self,x):
         return self.act(self.bn(self.conv(x)))
 
-# ------------------------
-# C2f (YOLOv8 style)
-# ------------------------
 class C2f(nn.Module):
     def __init__(self, c1, c2, n=1):
         super().__init__()
@@ -29,9 +22,6 @@ class C2f(nn.Module):
     def forward(self,x):
         return self.m(self.cv1(x))
 
-# ------------------------
-# Backbone (MobileNet)
-# ------------------------
 class Backbone(nn.Module):
     def __init__(self):
         super().__init__()
@@ -40,50 +30,39 @@ class Backbone(nn.Module):
     def forward(self,x):
         return self.body(x)
 
-# ------------------------
-# Neck (YOLOv8 style)
-# ------------------------
 class Neck(nn.Module):
     def __init__(self):
         super().__init__()
         self.p3 = Conv(24,96)
         self.p4 = Conv(48,192)
         self.p5 = Conv(576,384)
-
         self.up = nn.Upsample(scale_factor=2)
-
         self.c2f4 = C2f(384+192,192,2)
         self.c2f3 = C2f(192+96,96,2)
 
     def forward(self, feats):
-        p3,p4,p5 = feats['p3'],feats['p4'],feats['p5']
+        p3,p4,p5 = feats['p3'], feats['p4'], feats['p5']
         p3,p4,p5 = self.p3(p3), self.p4(p4), self.p5(p5)
-
-        p4 = self.c2f4(torch.cat([self.up(p5),p4],1))
-        p3 = self.c2f3(torch.cat([self.up(p4),p3],1))
-
+        p4 = self.c2f4(torch.cat([self.up(p5), p4],1))
+        p3 = self.c2f3(torch.cat([self.up(p4), p3],1))
         return p3,p4,p5
 
-# ------------------------
-# Head (decoupled)
-# ------------------------
 class Head(nn.Module):
     def __init__(self,c,nc):
         super().__init__()
         self.cls = nn.Sequential(Conv(c,c), nn.Conv2d(c,nc,1))
         self.box = nn.Sequential(Conv(c,c), nn.Conv2d(c,4,1))
-    def forward(self,x):
-        return self.box(x), self.cls(x)
+        self.obj = nn.Sequential(Conv(c,c), nn.Conv2d(c,1,1))
 
-# ------------------------
-# Model
-# ------------------------
-class Model(nn.Module):
+    def forward(self,x):
+        return self.box(x), self.obj(x), self.cls(x)
+
+class Modele(nn.Module):
     def __init__(self,nc=30):
         super().__init__()
+        self.nc = nc
         self.backbone = Backbone()
         self.neck = Neck()
-
         self.h3 = Head(96,nc)
         self.h4 = Head(192,nc)
         self.h5 = Head(384,nc)
@@ -91,15 +70,12 @@ class Model(nn.Module):
     def forward(self,x):
         feats = self.backbone(x)
         p3,p4,p5 = self.neck(feats)
-
         outputs=[]
         for p,h in zip([p3,p4,p5],[self.h3,self.h4,self.h5]):
-            box,cls = h(p)
-            b,_,h,w = box.shape
-
-            box = box.view(b,4,-1)
-            cls = cls.view(b,-1,h*w)
-
-            outputs.append(torch.cat([box,cls],1))
-
+            box,obj,cls = h(p)
+            b,_,hgt,wgt = box.shape
+            box = torch.sigmoid(box).view(b,4,-1)
+            obj = obj.view(b,1,-1)   # BCEWithLogitsLoss → pas sigmoid
+            cls = cls.view(b,self.nc,-1)  # BCEWithLogitsLoss → pas sigmoid
+            outputs.append(torch.cat([box,obj,cls],1))
         return torch.cat(outputs,2)
