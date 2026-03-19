@@ -62,6 +62,17 @@ def bbox_iou(box1, box2):
     
     return iou - (rho2 / c2 + v * alpha)
 
+def make_anchors(img_size=320, strides=[8, 16, 32]):
+    """Génère les coordonnées (x, y) pour chaque point de la grille."""
+    anchor_points = []
+    for s in strides:
+        h, w = img_size // s, img_size // s
+        sx = torch.arange(w) + 0.5
+        sy = torch.arange(h) + 0.5
+        grid_y, grid_x = torch.meshgrid(sy, sx, indexing='ij')
+        anchor_points.append(torch.stack((grid_x, grid_y), -1).view(-1, 2) * s)
+    return torch.cat(anchor_points)
+
 # ------------------------ Dataset ------------------------
 class Dataset(torch.utils.data.Dataset):
     def __init__(self, img_dir, label_dir, size, augment=False):

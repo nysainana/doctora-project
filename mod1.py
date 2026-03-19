@@ -88,6 +88,7 @@ class Modele(nn.Module):
 
     def forward(self, x):
         feats = self.backbone(x)
+
         p3, p4, p5 = self.neck(feats)
         
         outputs = []
