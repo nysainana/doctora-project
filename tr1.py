@@ -111,7 +111,7 @@ class UltraLowLoss(nn.Module):
         super().__init__()
         # On réduit un peu le pos_weight pour éviter que la loss obj ne soit trop haute
         self.bce_obj = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([5.0]).to(device))
-        self.bce_cls = nn.BCEWithLogitsLoss(label_smoothing=0.1) # Aide la loss à descendre plus bas
+        self.bce_cls = nn.BCEWithLogitsLoss() # label_smoothing appliqué manuellement dans forward
         self.nc = nc
         self.device = device
         self.grids = get_grids(CONFIG["img_size"]).to(device)
@@ -139,7 +139,8 @@ class UltraLowLoss(nn.Module):
                 target_cells = idxs[j]
                 t_obj[i, target_cells] = 1.0
                 t_cls[i, int(t[j, 0]), target_cells] = 1.0
-                t_box[i, :, target_cells] = t[j, 1:5]
+                # On ajoute .unsqueeze(1) pour permettre de copier la boîte dans les 3 cellules
+                t_box[i, :, target_cells] = t[j, 1:5].unsqueeze(1)
                 
                 # CIoU Loss (Scale Invariant)
                 p_b = p_box[i, :, target_cells].T
@@ -147,8 +148,15 @@ class UltraLowLoss(nn.Module):
                 loss_iou += (1.0 - bbox_iou(p_b, t_b)).sum()
 
         loss_obj = self.bce_obj(p_obj, t_obj)
+        
         mask = t_obj > 0
-        loss_cls = self.bce_cls(p_cls.transpose(1, 2)[mask], t_cls.transpose(1, 2)[mask]) if mask.any() else torch.tensor(0.0, device=self.device)
+        if mask.any():
+            target_cls = t_cls.transpose(1, 2)[mask]
+            # Application manuelle du Label Smoothing: 0 -> 0.05, 1 -> 0.95
+            target_cls = target_cls * (1.0 - 0.1) + 0.05
+            loss_cls = self.bce_cls(p_cls.transpose(1, 2)[mask], target_cls)
+        else:
+            loss_cls = torch.tensor(0.0, device=self.device)
         
         # Normalisation par le nombre d'objets pour une loss stable
         divisor = max(num_gts * 3, 1)
