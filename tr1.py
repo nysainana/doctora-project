@@ -1,219 +1,232 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from PIL import Image
 import os, sys
+import math
 from pathlib import Path
 from tqdm import tqdm
-from mod1 import Modele  # ton modèle MobileNetV3 + YOLOv8 style
+from mod1 import Modele 
 
 # ------------------------ CONFIG ------------------------
 CONFIG = {
     "num_classes": 30,
-    "epochs": 50,
-    "batch_size": 8,
+    "epochs": 100, # Augmenté pour atteindre les 90%+
+    "batch_size": 16, 
     "img_size": 320,
-    "lr": 1e-3,
+    "lr": 2e-3, # Augmenté légèrement pour OneCycleLR
     "train_img": Path("D:/elysa/doctora-project/data/train/images"),
     "train_label": Path("D:/elysa/doctora-project/data/train/labels"),
     "val_img": Path("D:/elysa/doctora-project/data/valid/images"),
     "val_label": Path("D:/elysa/doctora-project/data/valid/labels"),
     "checkpoint_dir": Path("checkpoints")
 }
-os.makedirs(CONFIG["checkpoint_dir"], exist_ok=True)
 
-# ------------------------ Helpers ------------------------
-def get_long_path(path):
-    """Prépare le chemin pour Windows pour supporter les noms longs (> 260 caractères)."""
-    abs_path = str(Path(path).absolute())
-    if sys.platform == "win32" and not abs_path.startswith("\\\\?\\"):
-        return "\\\\?\\" + abs_path
-    return abs_path
+# ------------------------ Fonctions Géométriques ------------------------
+def get_grids(size):
+    grids = []
+    strides = [8, 16, 32]
+    for s in strides:
+        g = size // s
+        y, x = torch.meshgrid(torch.arange(g), torch.arange(g), indexing='ij')
+        grid = torch.stack([x + 0.5, y + 0.5], dim=-1).view(-1, 2) / g
+        grids.append(grid)
+    return torch.cat(grids, 0)
+
+def bbox_iou(box1, box2, CIoU=True):
+    # box1: [N, 4] (x, y, w, h), box2: [N, 4]
+    b1_x1, b1_x2 = box1[:, 0] - box1[:, 2] / 2, box1[:, 0] + box1[:, 2] / 2
+    b1_y1, b1_y2 = box1[:, 1] - box1[:, 3] / 2, box1[:, 1] + box1[:, 3] / 2
+    b2_x1, b2_x2 = box2[:, 0] - box2[:, 2] / 2, box2[:, 0] + box2[:, 2] / 2
+    b2_y1, b2_y2 = box2[:, 1] - box2[:, 3] / 2, box2[:, 1] + box2[:, 3] / 2
+
+    inter = (torch.min(b1_x2, b2_x2) - torch.max(b1_x1, b2_x1)).clamp(0) * \
+            (torch.min(b1_y2, b2_y2) - torch.max(b1_y1, b2_y1)).clamp(0)
+    
+    union = box1[:, 2] * box1[:, 3] + box2[:, 2] * box2[:, 3] - inter + 1e-7
+    iou = inter / union
+
+    if CIoU:
+        cw = torch.max(b1_x2, b2_x2) - torch.min(b1_x1, b2_x1)
+        ch = torch.max(b1_y2, b2_y2) - torch.min(b1_y1, b2_y1)
+        c2 = cw**2 + ch**2 + 1e-7
+        rho2 = ((b1_x1 + b1_x2 - b2_x1 - b2_x2)**2 + (b1_y1 + b1_y2 - b2_y1 - b2_y2)**2) / 4
+        v = (4 / math.pi**2) * torch.pow(torch.atan(box1[:, 2] / (box1[:, 3] + 1e-7)) - torch.atan(box2[:, 2] / (box2[:, 3] + 1e-7)), 2)
+        with torch.no_grad():
+            alpha = v / (1 - iou + v + 1e-7)
+        return iou - (rho2 / c2 + v * alpha)
+    return iou
 
 # ------------------------ Dataset ------------------------
 class Dataset(torch.utils.data.Dataset):
-    def __init__(self, img_dir, label_dir, size):
+    def __init__(self, img_dir, label_dir, size, augment=False):
         self.img_dir = Path(img_dir)
         self.label_dir = Path(label_dir)
-        self.imgs = list(self.img_dir.glob("*.jpg")) + list(self.img_dir.glob("*.jpeg")) + list(self.img_dir.glob("*.png"))
-        self.tf = transforms.Compose([
-            transforms.Resize((size, size)),
-            transforms.ToTensor()
-        ])
-    def __len__(self):
-        return len(self.imgs)
+        self.imgs = list(self.img_dir.glob("*.jpg")) + list(self.img_dir.glob("*.png"))
+        self.size = size
+        self.augment = augment
+        self.norm = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        
+        if self.augment:
+            self.transform = transforms.Compose([
+                transforms.Resize((size, size)),
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.ColorJitter(0.2, 0.2, 0.2),
+                transforms.RandomGrayscale(0.1),
+                transforms.ToTensor(),
+                self.norm
+            ])
+        else:
+            self.transform = transforms.Compose([
+                transforms.Resize((size, size)),
+                transforms.ToTensor(),
+                self.norm
+            ])
+
+    def __len__(self): return len(self.imgs)
     def __getitem__(self, i):
         img_path = self.imgs[i]
-        long_img_path = get_long_path(img_path)
-        img = Image.open(long_img_path).convert("RGB")
-        img = self.tf(img)
+        img = Image.open(img_path).convert("RGB")
+        img_tensor = self.transform(img)
         
         label_path = self.label_dir / (img_path.stem + ".txt")
-        long_label_path = get_long_path(label_path)
-        
         labels = []
-        if os.path.exists(long_label_path):
-            try:
-                with open(long_label_path, "r") as f:
-                    for l in f:
-                        parts = [float(x) for x in l.split()]
-                        if len(parts) == 5:
-                            labels.append(parts)
-            except Exception as e:
-                print(f"Erreur lecture label {label_path}: {e}")
-                
-        return img, torch.tensor(labels)
+        if label_path.exists():
+            with open(label_path, "r") as f:
+                for l in f:
+                    parts = [float(x) for x in l.split()]
+                    if len(parts) == 5: labels.append(parts)
+        return img_tensor, torch.tensor(labels)
 
 def collate_fn(batch):
     imgs, targets = zip(*batch)
     return torch.stack(imgs), targets
 
-# ------------------------ Loss ------------------------
-class Loss(nn.Module):
+# ------------------------ Loss (CIoU + Focal) ------------------------
+class RobustLoss(nn.Module):
     def __init__(self, nc, device):
         super().__init__()
-        self.bce = nn.BCEWithLogitsLoss()
+        self.bce_obj = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([10.0]).to(device))
+        self.bce_cls = nn.BCEWithLogitsLoss()
         self.nc = nc
         self.device = device
+        self.grids = get_grids(CONFIG["img_size"]).to(device)
+
     def forward(self, pred, targets):
         B, C, N = pred.shape
-        pb = pred[:, :4, :]
-        pc = pred[:, 4:, :]
-        loss = 0
+        p_box = pred[:, :4, :]
+        p_obj = pred[:, 4, :]
+        p_cls = pred[:, 5:, :]
+
+        t_obj = torch.zeros((B, N), device=self.device)
+        t_cls = torch.zeros((B, self.nc, N), device=self.device)
+        t_box = torch.zeros((B, 4, N), device=self.device)
+        
+        loss_iou = torch.tensor(0.0, device=self.device)
+
         for i in range(B):
-            if len(targets[i]) == 0:
-                continue
+            if len(targets[i]) == 0: continue
             t = targets[i].to(self.device)
-            boxes = t[:, 1:5] * CONFIG["img_size"]
-            cls = t[:, 0].long()
-            idx = torch.randint(0, N, (len(t),), device=pred.device)
-            loss += ((pb[i, :, idx].T - boxes) ** 2).mean()
-            tcls = torch.zeros_like(pc[i])
-            for j, c in enumerate(cls):
-                tcls[c, idx[j]] = 1
-            loss += self.bce(pc[i], tcls)
-        return loss
+            t_xy = t[:, 1:3]
+            
+            dist = torch.cdist(t_xy, self.grids)
+            val, idxs = torch.topk(dist, k=3, largest=False, dim=1) 
+            
+            for j in range(len(t)):
+                target_cells = idxs[j]
+                t_obj[i, target_cells] = 1.0
+                for cell_idx in target_cells:
+                    t_cls[i, int(t[j, 0]), cell_idx] = 1.0
+                    t_box[i, :, cell_idx] = t[j, 1:5]
+                
+                # Calcul de la perte CIoU pour les cellules positives
+                p_box_cells = p_box[i, :, target_cells].T # [3, 4]
+                t_box_cells = t[j, 1:5].repeat(3, 1) # [3, 4]
+                loss_iou += (1.0 - bbox_iou(p_box_cells, t_box_cells)).mean()
 
-# ------------------------ Metrics ------------------------
-def accuracy(pred, targets):
-    total = 0
-    correct = 0
+        loss_obj = self.bce_obj(p_obj, t_obj)
+        mask = t_obj > 0
+        if mask.any():
+            loss_cls = self.bce_cls(p_cls.transpose(1, 2)[mask], t_cls.transpose(1, 2)[mask])
+        else:
+            loss_cls = torch.tensor(0.0, device=self.device)
+
+        return (7.5 * loss_iou / B) + (1.0 * loss_obj) + (0.5 * loss_cls)
+
+# ------------------------ Accuracy ------------------------
+def calculate_accuracy(pred, targets):
     B, C, N = pred.shape
-    pb = torch.sigmoid(pred[:, 4:, :])
+    device = pred.device
+    grids = get_grids(CONFIG["img_size"]).to(device)
+    correct, total = 0, 0
+    p_obj = torch.sigmoid(pred[:, 4, :])
+    p_cls = torch.sigmoid(pred[:, 5:, :])
+    
     for i in range(B):
-        if len(targets[i]) == 0:
-            continue
-        t = targets[i].to(pred.device)
-        cls = t[:, 0].long()
-        idx = torch.randint(0, N, (len(t),), device=pred.device)
-        for j, c in enumerate(cls):
-            p_class = torch.argmax(pb[i, :, idx[j]])
-            if p_class == c:
-                correct += 1
+        if len(targets[i]) == 0: continue
+        t = targets[i].to(device)
+        for obj in t:
+            dist = torch.cdist(obj[1:3].unsqueeze(0), grids)
+            _, near_idxs = torch.topk(dist, k=5, largest=False)
+            near_idxs = near_idxs[0]
+            found = False
+            for idx in near_idxs:
+                if p_obj[i, idx] > 0.4: # Seuil un peu plus haut pour la qualité
+                    if torch.argmax(p_cls[i, :, idx]) == int(obj[0]):
+                        found = True
+                        break
+            if found: correct += 1
             total += 1
-    return correct / total if total > 0 else 0
+    return (correct / total * 100) if total > 0 else 0
 
-# ------------------------ Training ------------------------
-def train(resume=False, resume_path=None):
+# ------------------------ Main ------------------------
+def train():
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    os.makedirs(CONFIG["checkpoint_dir"], exist_ok=True)
+    
     modele = Modele(CONFIG["num_classes"]).to(device)
-    optimizer = optim.Adam(modele.parameters(), lr=CONFIG["lr"])
-    loss_fn = Loss(CONFIG["num_classes"], device)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
-
-    train_loader = DataLoader(
-        Dataset(CONFIG["train_img"], CONFIG["train_label"], CONFIG["img_size"]),
-        batch_size=CONFIG["batch_size"], shuffle=True, collate_fn=collate_fn
-    )
-    val_loader = DataLoader(
-        Dataset(CONFIG["val_img"], CONFIG["val_label"], CONFIG["img_size"]),
-        batch_size=CONFIG["batch_size"], shuffle=False, collate_fn=collate_fn
-    )
-
-    start_epoch = 0
-    best_val_loss = float('inf')
-    patience_counter = 0
-    early_stop_patience = 7
-
-    # Charger checkpoint si resume
-    if resume and resume_path and os.path.exists(resume_path):
-        checkpoint = torch.load(resume_path, map_location=device)
-        modele.load_state_dict(checkpoint["model_state"])
-        optimizer.load_state_dict(checkpoint["optimizer_state"])
-        start_epoch = checkpoint["epoch"] + 1
-        best_val_loss = checkpoint["best_val_loss"]
-        print(f"Reprise de l'entraînement à l'epoch {start_epoch}")
-
-    for epoch in range(start_epoch, CONFIG["epochs"]):
+    optimizer = optim.AdamW(modele.parameters(), lr=CONFIG["lr"], weight_decay=1e-2)
+    
+    train_loader = DataLoader(Dataset(CONFIG["train_img"], CONFIG["train_label"], CONFIG["img_size"], True), 
+                              batch_size=CONFIG["batch_size"], shuffle=True, collate_fn=collate_fn)
+    val_loader = DataLoader(Dataset(CONFIG["val_img"], CONFIG["val_label"], CONFIG["img_size"], False), 
+                            batch_size=CONFIG["batch_size"], collate_fn=collate_fn)
+    
+    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=CONFIG["lr"], 
+                                              steps_per_epoch=len(train_loader), epochs=CONFIG["epochs"])
+    loss_fn = RobustLoss(CONFIG["num_classes"], device)
+    
+    best_acc = 0
+    for epoch in range(CONFIG["epochs"]):
         modele.train()
-        train_loss = 0
-        train_acc = 0
-        pbar = tqdm(train_loader, desc=f"Train {epoch+1}/{CONFIG['epochs']}")
-        for imgs, tg in pbar:
+        r_loss, r_acc = 0, 0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
+        for i, (imgs, tg) in enumerate(pbar):
             imgs = imgs.to(device)
-            pred = modele(imgs)
-            loss = loss_fn(pred, tg)
-            acc = accuracy(pred, tg)
-
+            out = modele(imgs)
+            loss = loss_fn(out, tg)
+            
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            scheduler.step()
+            
+            acc = calculate_accuracy(out, tg)
+            r_loss += loss.item()
+            r_acc += acc
+            pbar.set_postfix({"loss": f"{r_loss/(i+1):.3f}", "acc": f"{r_acc/(i+1):.1f}%"})
 
-            train_loss += loss.item()
-            train_acc += acc
-            pbar.set_postfix({"loss": f"{loss.item():.4f}", "acc": f"{acc:.4f}"})
-
-        train_loss /= len(train_loader)
-        train_acc /= len(train_loader)
-
-        # Validation
         modele.eval()
-        val_loss = 0
-        val_acc = 0
-        with torch.no_grad():
-            for imgs, tg in tqdm(val_loader, desc="Validation"):
-                imgs = imgs.to(device)
-                pred = modele(imgs)
-                loss = loss_fn(pred, tg)
-                acc = accuracy(pred, tg)
-                val_loss += loss.item()
-                val_acc += acc
-
-        val_loss /= len(val_loader)
-        val_acc /= len(val_loader)
-        print(f"Epoch {epoch+1} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
-
-        # Scheduler step
-        scheduler.step(val_loss)
-        print(f"Learning rate actuel: {optimizer.param_groups[0]['lr']:.6f}")
-
-        # Early stopping
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_counter = 0
-            # Sauvegarder le meilleur modèle
-            torch.save({
-                "epoch": epoch,
-                "model_state": modele.state_dict(),
-                "optimizer_state": optimizer.state_dict(),
-                "best_val_loss": best_val_loss
-            }, os.path.join(CONFIG["checkpoint_dir"], "best_model.pth"))
-        else:
-            patience_counter += 1
-            if patience_counter >= early_stop_patience:
-                print("Early stopping déclenché !")
-                break
-
-        # Sauvegarde après chaque epoch
-        torch.save({
-            "epoch": epoch,
-            "model_state": modele.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "best_val_loss": best_val_loss
-        }, os.path.join(CONFIG["checkpoint_dir"], f"checkpoint_epoch{epoch+1}.pth"))
+        v_acc = sum(calculate_accuracy(modele(imgs.to(device)), tg) for imgs, tg in val_loader) / len(val_loader)
+        print(f"Val Acc: {v_acc:.2f}%")
+        
+        if v_acc > best_acc:
+            best_acc = v_acc
+            torch.save(modele.state_dict(), CONFIG["checkpoint_dir"] / "best.pth")
+            print(f"--- Nouveau Record: {best_acc:.2f}% ---")
 
 if __name__ == "__main__":
-    latest_ckpt = os.path.join(CONFIG["checkpoint_dir"], "best_model.pth")
-    train(resume=True, resume_path=latest_ckpt)
+    train()
