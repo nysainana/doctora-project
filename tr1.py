@@ -14,10 +14,10 @@ from mod1 import Modele
 # ------------------------ CONFIG ------------------------
 CONFIG = {
     "num_classes": 30,
-    "epochs": 100, # Augmenté pour atteindre les 90%+
+    "epochs": 100,
     "batch_size": 16, 
     "img_size": 320,
-    "lr": 2e-3, # Augmenté légèrement pour OneCycleLR
+    "lr": 1e-3, 
     "train_img": Path("D:/elysa/doctora-project/data/train/images"),
     "train_label": Path("D:/elysa/doctora-project/data/train/labels"),
     "val_img": Path("D:/elysa/doctora-project/data/valid/images"),
@@ -36,8 +36,8 @@ def get_grids(size):
         grids.append(grid)
     return torch.cat(grids, 0)
 
-def bbox_iou(box1, box2, CIoU=True):
-    # box1: [N, 4] (x, y, w, h), box2: [N, 4]
+def bbox_iou(box1, box2):
+    # CIoU Implementation pour une précision maximale
     b1_x1, b1_x2 = box1[:, 0] - box1[:, 2] / 2, box1[:, 0] + box1[:, 2] / 2
     b1_y1, b1_y2 = box1[:, 1] - box1[:, 3] / 2, box1[:, 1] + box1[:, 3] / 2
     b2_x1, b2_x2 = box2[:, 0] - box2[:, 2] / 2, box2[:, 0] + box2[:, 2] / 2
@@ -49,16 +49,18 @@ def bbox_iou(box1, box2, CIoU=True):
     union = box1[:, 2] * box1[:, 3] + box2[:, 2] * box2[:, 3] - inter + 1e-7
     iou = inter / union
 
-    if CIoU:
-        cw = torch.max(b1_x2, b2_x2) - torch.min(b1_x1, b2_x1)
-        ch = torch.max(b1_y2, b2_y2) - torch.min(b1_y1, b2_y1)
-        c2 = cw**2 + ch**2 + 1e-7
-        rho2 = ((b1_x1 + b1_x2 - b2_x1 - b2_x2)**2 + (b1_y1 + b1_y2 - b2_y1 - b2_y2)**2) / 4
-        v = (4 / math.pi**2) * torch.pow(torch.atan(box1[:, 2] / (box1[:, 3] + 1e-7)) - torch.atan(box2[:, 2] / (box2[:, 3] + 1e-7)), 2)
-        with torch.no_grad():
-            alpha = v / (1 - iou + v + 1e-7)
-        return iou - (rho2 / c2 + v * alpha)
-    return iou
+    # Distance des centres
+    cw = torch.max(b1_x2, b2_x2) - torch.min(b1_x1, b2_x1)
+    ch = torch.max(b1_y2, b2_y2) - torch.min(b1_y1, b2_y1)
+    c2 = cw**2 + ch**2 + 1e-7
+    rho2 = ((b1_x1 + b1_x2 - b2_x1 - b2_x2)**2 + (b1_y1 + b1_y2 - b2_y1 - b2_y2)**2) / 4
+    
+    # Aspect Ratio
+    v = (4 / math.pi**2) * torch.pow(torch.atan(box1[:, 2] / (box1[:, 3] + 1e-7)) - torch.atan(box2[:, 2] / (box2[:, 3] + 1e-7)), 2)
+    with torch.no_grad():
+        alpha = v / (1 - iou + v + 1e-7)
+    
+    return iou - (rho2 / c2 + v * alpha)
 
 # ------------------------ Dataset ------------------------
 class Dataset(torch.utils.data.Dataset):
@@ -73,9 +75,8 @@ class Dataset(torch.utils.data.Dataset):
         if self.augment:
             self.transform = transforms.Compose([
                 transforms.Resize((size, size)),
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.ColorJitter(0.2, 0.2, 0.2),
-                transforms.RandomGrayscale(0.1),
+                transforms.RandomHorizontalFlip(),
+                transforms.ColorJitter(0.1, 0.1, 0.1),
                 transforms.ToTensor(),
                 self.norm
             ])
@@ -91,7 +92,6 @@ class Dataset(torch.utils.data.Dataset):
         img_path = self.imgs[i]
         img = Image.open(img_path).convert("RGB")
         img_tensor = self.transform(img)
-        
         label_path = self.label_dir / (img_path.stem + ".txt")
         labels = []
         if label_path.exists():
@@ -105,56 +105,55 @@ def collate_fn(batch):
     imgs, targets = zip(*batch)
     return torch.stack(imgs), targets
 
-# ------------------------ Loss (CIoU + Focal) ------------------------
-class RobustLoss(nn.Module):
+# ------------------------ Loss Ultra-Basse ------------------------
+class UltraLowLoss(nn.Module):
     def __init__(self, nc, device):
         super().__init__()
-        self.bce_obj = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([10.0]).to(device))
-        self.bce_cls = nn.BCEWithLogitsLoss()
+        # On réduit un peu le pos_weight pour éviter que la loss obj ne soit trop haute
+        self.bce_obj = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([5.0]).to(device))
+        self.bce_cls = nn.BCEWithLogitsLoss(label_smoothing=0.1) # Aide la loss à descendre plus bas
         self.nc = nc
         self.device = device
         self.grids = get_grids(CONFIG["img_size"]).to(device)
 
     def forward(self, pred, targets):
         B, C, N = pred.shape
-        p_box = pred[:, :4, :]
-        p_obj = pred[:, 4, :]
-        p_cls = pred[:, 5:, :]
+        p_box, p_obj, p_cls = pred[:, :4, :], pred[:, 4, :], pred[:, 5:, :]
 
         t_obj = torch.zeros((B, N), device=self.device)
         t_cls = torch.zeros((B, self.nc, N), device=self.device)
         t_box = torch.zeros((B, 4, N), device=self.device)
         
         loss_iou = torch.tensor(0.0, device=self.device)
+        num_gts = 0
 
         for i in range(B):
             if len(targets[i]) == 0: continue
             t = targets[i].to(self.device)
-            t_xy = t[:, 1:3]
+            num_gts += len(t)
             
-            dist = torch.cdist(t_xy, self.grids)
-            val, idxs = torch.topk(dist, k=3, largest=False, dim=1) 
+            dist = torch.cdist(t[:, 1:3], self.grids)
+            _, idxs = torch.topk(dist, k=3, largest=False, dim=1) 
             
             for j in range(len(t)):
                 target_cells = idxs[j]
                 t_obj[i, target_cells] = 1.0
-                for cell_idx in target_cells:
-                    t_cls[i, int(t[j, 0]), cell_idx] = 1.0
-                    t_box[i, :, cell_idx] = t[j, 1:5]
+                t_cls[i, int(t[j, 0]), target_cells] = 1.0
+                t_box[i, :, target_cells] = t[j, 1:5]
                 
-                # Calcul de la perte CIoU pour les cellules positives
-                p_box_cells = p_box[i, :, target_cells].T # [3, 4]
-                t_box_cells = t[j, 1:5].repeat(3, 1) # [3, 4]
-                loss_iou += (1.0 - bbox_iou(p_box_cells, t_box_cells)).mean()
+                # CIoU Loss (Scale Invariant)
+                p_b = p_box[i, :, target_cells].T
+                t_b = t[j, 1:5].repeat(3, 1)
+                loss_iou += (1.0 - bbox_iou(p_b, t_b)).sum()
 
         loss_obj = self.bce_obj(p_obj, t_obj)
         mask = t_obj > 0
-        if mask.any():
-            loss_cls = self.bce_cls(p_cls.transpose(1, 2)[mask], t_cls.transpose(1, 2)[mask])
-        else:
-            loss_cls = torch.tensor(0.0, device=self.device)
-
-        return (7.5 * loss_iou / B) + (1.0 * loss_obj) + (0.5 * loss_cls)
+        loss_cls = self.bce_cls(p_cls.transpose(1, 2)[mask], t_cls.transpose(1, 2)[mask]) if mask.any() else torch.tensor(0.0, device=self.device)
+        
+        # Normalisation par le nombre d'objets pour une loss stable
+        divisor = max(num_gts * 3, 1)
+        total_loss = (10.0 * loss_iou / divisor) + (1.0 * loss_obj) + (1.0 * loss_cls)
+        return total_loss
 
 # ------------------------ Accuracy ------------------------
 def calculate_accuracy(pred, targets):
@@ -162,9 +161,7 @@ def calculate_accuracy(pred, targets):
     device = pred.device
     grids = get_grids(CONFIG["img_size"]).to(device)
     correct, total = 0, 0
-    p_obj = torch.sigmoid(pred[:, 4, :])
-    p_cls = torch.sigmoid(pred[:, 5:, :])
-    
+    p_obj, p_cls = torch.sigmoid(pred[:, 4, :]), torch.sigmoid(pred[:, 5:, :])
     for i in range(B):
         if len(targets[i]) == 0: continue
         t = targets[i].to(device)
@@ -174,30 +171,24 @@ def calculate_accuracy(pred, targets):
             near_idxs = near_idxs[0]
             found = False
             for idx in near_idxs:
-                if p_obj[i, idx] > 0.4: # Seuil un peu plus haut pour la qualité
-                    if torch.argmax(p_cls[i, :, idx]) == int(obj[0]):
-                        found = True
-                        break
+                if p_obj[i, idx] > 0.4 and torch.argmax(p_cls[i, :, idx]) == int(obj[0]):
+                    found = True; break
             if found: correct += 1
             total += 1
     return (correct / total * 100) if total > 0 else 0
 
-# ------------------------ Main ------------------------
+# ------------------------ Train ------------------------
 def train():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(CONFIG["checkpoint_dir"], exist_ok=True)
-    
     modele = Modele(CONFIG["num_classes"]).to(device)
     optimizer = optim.AdamW(modele.parameters(), lr=CONFIG["lr"], weight_decay=1e-2)
     
-    train_loader = DataLoader(Dataset(CONFIG["train_img"], CONFIG["train_label"], CONFIG["img_size"], True), 
-                              batch_size=CONFIG["batch_size"], shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(Dataset(CONFIG["val_img"], CONFIG["val_label"], CONFIG["img_size"], False), 
-                            batch_size=CONFIG["batch_size"], collate_fn=collate_fn)
+    train_loader = DataLoader(Dataset(CONFIG["train_img"], CONFIG["train_label"], CONFIG["img_size"], True), batch_size=CONFIG["batch_size"], shuffle=True, collate_fn=collate_fn)
+    val_loader = DataLoader(Dataset(CONFIG["val_img"], CONFIG["val_label"], CONFIG["img_size"], False), batch_size=CONFIG["batch_size"], collate_fn=collate_fn)
     
-    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=CONFIG["lr"], 
-                                              steps_per_epoch=len(train_loader), epochs=CONFIG["epochs"])
-    loss_fn = RobustLoss(CONFIG["num_classes"], device)
+    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=CONFIG["lr"], steps_per_epoch=len(train_loader), epochs=CONFIG["epochs"])
+    loss_fn = UltraLowLoss(CONFIG["num_classes"], device)
     
     best_acc = 0
     for epoch in range(CONFIG["epochs"]):
@@ -211,18 +202,18 @@ def train():
             
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(modele.parameters(), max_norm=10.0) # Sécurité
             optimizer.step()
             scheduler.step()
             
             acc = calculate_accuracy(out, tg)
             r_loss += loss.item()
             r_acc += acc
-            pbar.set_postfix({"loss": f"{r_loss/(i+1):.3f}", "acc": f"{r_acc/(i+1):.1f}%"})
+            pbar.set_postfix({"loss": f"{r_loss/(i+1):.4f}", "acc": f"{r_acc/(i+1):.1f}%"})
 
         modele.eval()
         v_acc = sum(calculate_accuracy(modele(imgs.to(device)), tg) for imgs, tg in val_loader) / len(val_loader)
         print(f"Val Acc: {v_acc:.2f}%")
-        
         if v_acc > best_acc:
             best_acc = v_acc
             torch.save(modele.state_dict(), CONFIG["checkpoint_dir"] / "best.pth")
